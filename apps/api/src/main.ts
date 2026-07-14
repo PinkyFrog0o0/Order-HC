@@ -2,6 +2,7 @@
  * NestJS 应用入口
  */
 
+import './polyfill-fetch';
 import 'reflect-metadata';
 
 import { Logger } from '@nestjs/common';
