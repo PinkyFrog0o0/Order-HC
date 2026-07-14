@@ -1,0 +1,128 @@
+# Haycargo 生产部署
+#
+# 启动：
+#   1. 复制 .env.prod.example 为 .env.prod 并填好真实密钥
+#   2. docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#
+# 停止（保留数据）：docker compose -f docker-compose.prod.yml down
+# 重置（删库）：    docker compose -f docker-compose.prod.yml down -v
+#
+# 端口：7700 (Web) + 7707 (API) 暴露到主机
+# 内部：postgres / redis / minio 仅 compose 网络内可访问
+
+name: haycargo
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: haycargo-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: haycargo
+      POSTGRES_PASSWORD: haycargo
+      POSTGRES_DB: haycargo
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U haycargo -d haycargo']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: haycargo-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: haycargo-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: haycargo
+      MINIO_ROOT_PASSWORD: haycargo
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: haycargo-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 haycargo haycargo &&
+      mc mb --ignore-existing local/haycargo-files &&
+      mc anonymous set download local/haycargo-files &&
+      echo 'MinIO bucket haycargo-files ready'
+      "
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: haycargo-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      API_VERSION: v1
+      LOG_LEVEL: info
+      # 网络内部主机名（compose 自动 DNS 解析）
+      DATABASE_URL: postgresql://haycargo:haycargo@postgres:5432/haycargo
+      REDIS_URL: redis://redis:6379
+      # JWT 与 OSS 凭据从 .env.prod 读（避免硬编码到 git）
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      OSS_ENDPOINT: http://minio:9000
+      OSS_REGION: ${OSS_REGION:-us-east-1}
+      OSS_ACCESS_KEY: ${OSS_ACCESS_KEY}
+      OSS_SECRET_KEY: ${OSS_SECRET_KEY}
+      OSS_BUCKET: ${OSS_BUCKET:-haycargo-files}
+      OSS_FORCE_PATH_STYLE: "true"
+      # Web 访问来源（CORS 用）
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      TENANT_HEADER: x-tenant-id
+      SUPER_ADMIN_BYPASS_TENANT: "true"
+      # 检查更新（GitHub Releases）
+      GITHUB_REPO: ${GITHUB_REPO:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "7707:3000"
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: haycargo-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "7700:80"
+
+volumes:
+  pg_data:
+  minio_data:
