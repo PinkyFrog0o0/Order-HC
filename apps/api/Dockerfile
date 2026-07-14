@@ -3,17 +3,17 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# pnpm via corepack (锁定版本与 lockfile 一致)
+# pnpm via corepack（与 lockfile 一致）
 RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
 
-# 复制 workspace 根文件 + 子包 manifest
-COPY pnpm-workspace.yaml package.json pnpm-lock.yaml .npmrc* ./
+# 复制 workspace 根 manifest + 各子包 manifest
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
 COPY apps/api/package.json ./apps/api/
 COPY apps/web/package.json ./apps/web/
 COPY packages/shared/package.json ./packages/shared/
 COPY packages/eslint-config/package.json ./packages/eslint-config/
 
-# 安装依赖（含 devDeps，构建需要）
+# 装依赖
 RUN pnpm install --frozen-lockfile
 
 # 复制源码
@@ -22,54 +22,31 @@ COPY apps/api ./apps/api
 COPY apps/web ./apps/web
 COPY packages ./packages
 
-# 关键：先生成 Prisma Client，再 build（NestJS 编译需要 prisma 类型）
+# 生成 Prisma Client 后 build（NestJS 编译需要 prisma 类型）
 RUN pnpm --filter @haycargo/api exec prisma generate
 RUN pnpm --filter @haycargo/api build
 
+# 用 pnpm deploy 创建自包含的部署包（解析 symlink，包含全部运行时依赖）
+RUN pnpm --filter @haycargo/api deploy /tmp/api-deploy
+# pnpm deploy 不会带这些手动加的文件，补上
+RUN cp -r /app/apps/api/dist /tmp/api-deploy/dist && \
+    cp -r /app/apps/api/prisma /tmp/api-deploy/prisma && \
+    cp /app/apps/api/start.sh /tmp/api-deploy/start.sh && \
+    chmod +x /tmp/api-deploy/start.sh
+
 # === Runtime stage ===
-FROM node:20-alpine AS runner
+FROM node:20-alpine
 
 WORKDIR /app
 
-ENV NODE_ENV=production
+# psql（跑 RLS SQL） + curl（healthcheck） + bash（start.sh 用）
+RUN apk add --no-cache postgresql-client curl bash
 
-# 安装 psql（用于跑 RLS SQL 文件）
-RUN apk add --no-cache postgresql-client curl
-
-# 复制构建产物
-COPY --from=builder /app/apps/api/dist ./apps/api/dist
-COPY --from=builder /app/apps/api/prisma ./apps/api/prisma
-COPY --from=builder /app/apps/api/package.json ./apps/api/package.json
-COPY --from=builder /app/apps/api/start.sh ./apps/api/start.sh
-
-# 复制生产依赖（精确拷贝，避免 devDeps）
-COPY --from=builder /app/apps/api/node_modules ./apps/api/node_modules
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/packages/shared ./packages/shared
-COPY --from=builder /app/packages/shared/node_modules ./packages/shared/node_modules
-
-# 复制 Prisma 生成的 client（位于 node_modules/.prisma 和 @prisma/client）
-COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
-COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
-COPY --from=builder /app/apps/api/node_modules/.prisma ./apps/api/node_modules/.prisma
-COPY --from=builder /app/apps/api/node_modules/@prisma ./apps/api/node_modules/@prisma
-
-# 复制 ts-node（seed 脚本需要，体积 ~50MB）
-COPY --from=builder /app/apps/api/node_modules/ts-node ./apps/api/node_modules/ts-node
-COPY --from=builder /app/node_modules/ts-node ./node_modules/ts-node
-COPY --from=builder /app/apps/api/node_modules/typescript ./apps/api/node_modules/typescript
-COPY --from=builder /app/node_modules/typescript ./node_modules/typescript
-
-# 复制 tsconfig（ts-node 解析路径用）
-COPY --from=builder /app/apps/api/tsconfig.json ./apps/api/tsconfig.json
-
-RUN chmod +x /app/apps/api/start.sh
-
-WORKDIR /app/apps/api
+# 复制自包含部署包
+COPY --from=builder /tmp/api-deploy /app
 
 EXPOSE 3000
 
-# 健康检查
 HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=5 \
     CMD curl -fsS http://localhost:3000/v1/system/version || exit 1
 
