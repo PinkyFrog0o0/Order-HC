@@ -10,6 +10,8 @@ import { Injectable, Logger } from '@nestjs/common';
 
 import { loadEnv } from '../config/env';
 
+import { UpdateRunner, UpdateStatus } from './update-runner';
+
 /**
  * 当前产品版本。
  *
@@ -34,6 +36,8 @@ export interface VersionCheckResult {
 @Injectable()
 export class VersionService {
   private readonly logger = new Logger(VersionService.name);
+
+  constructor(private readonly updateRunner: UpdateRunner) {}
 
   async check(): Promise<VersionCheckResult> {
     const env = loadEnv();
@@ -99,6 +103,22 @@ export class VersionService {
         error: (err as Error).message,
       };
     }
+  }
+
+  /**
+   * 触发一次更新（管理员操作）。
+   * 实际是扔 update.sh 去 background；并发触发由 runner 自己抛 UpdateAlreadyRunningError。
+   */
+  applyUpdate(): { startedAt: string } {
+    this.updateRunner.start();
+    return { startedAt: new Date().toISOString() };
+  }
+
+  /**
+   * 查询当前更新任务状态。
+   */
+  getUpdateStatus(): UpdateStatus {
+    return this.updateRunner.status();
   }
 }
 
