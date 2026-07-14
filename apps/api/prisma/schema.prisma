@@ -1,0 +1,463 @@
+// Haycargo Prisma Schema
+//
+// 设计原则：
+// 1. 所有业务表带 tenant_id（多租户隔离第一原则）
+// 2. snake_case 命名（与 PostgreSQL 约定一致）
+// 3. UUID 主键（不暴露业务量）
+// 4. 时间戳统一 created_at / updated_at
+// 5. 软删除：deleted_at（保留审计追溯能力）
+// 6. RLS 策略在迁移文件里单独启用（不靠应用层防漏）
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// 多租户基础
+// ============================================================
+
+/// 租户 = 一个货主公司 / 清关代理公司的客户主体
+model Tenant {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String   @unique // 业务用短码，如 "XM001"
+  name        String
+  status      String   @default("active") // active | suspended | deleted
+  contact     Json?    // 联系信息（电话、邮箱、地址）
+  settings    Json?    // 租户级配置（保留扩展点）
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  users        User[]
+  inquiryOrders InquiryOrder[]
+  quotes        ClearanceQuote[]
+
+  @@index([code])
+  @@index([status])
+  @@map("tenants")
+}
+
+/// 用户（可属于管理端或客户端）
+/// 通过 role 字段区分身份：
+/// - admin: 内部管理端（操作员/财务/运营）
+/// - client: 客户端货主用户
+model User {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String?  @map("tenant_id") @db.Uuid // 管理员可为空
+  email         String?  @unique
+  phone         String?  @unique
+  passwordHash  String   @map("password_hash")
+  fullName      String   @map("full_name")
+  role          String   // admin: super_admin | admin | operator | finance | ops
+                         // client: client_admin | client_user | client_finance
+  status        String   @default("active") // active | disabled
+  lastLoginAt   DateTime? @map("last_login_at")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  tenant        Tenant?  @relation(fields: [tenantId], references: [id])
+  auditLogs     AuditLog[]
+  createdInquiries InquiryOrder[] @relation("InquiryCreatedBy")
+
+  @@index([tenantId])
+  @@index([role])
+  @@map("users")
+}
+
+// ============================================================
+// 询价单（核心业务）
+// ============================================================
+
+/// 询价单主表
+model InquiryOrder {
+  id                  String   @id @default(uuid()) @db.Uuid
+  tenantId            String   @map("tenant_id") @db.Uuid
+  businessNumber      String   @unique @map("business_number")
+  customerCode        String   @map("customer_code") // 货主代码
+
+  // 贸易基础信息
+  tradeType           String   @map("trade_type") // import | export
+  incoterm            String   // EXW | FOB | CIF | DDP | DAP | FCA
+  originCountry       String   @map("origin_country") @db.Char(3)
+  destinationCountry  String   @map("destination_country") @db.Char(3)
+  originPort          String   @map("origin_port")
+  destinationPort     String   @map("destination_port") @db.Char(3)
+
+  // 汇总（冗余存，便于检索/列表）
+  totalGrossWeightKg  Decimal  @map("total_gross_weight_kg") @db.Decimal(12, 3)
+  totalNetWeightKg    Decimal  @map("total_net_weight_kg") @db.Decimal(12, 3)
+  totalPackages       Int      @map("total_packages")
+  totalValue          Decimal  @map("total_value") @db.Decimal(18, 2)
+  currency            String   @db.Char(3)
+
+  // 状态机（见 packages/shared/src/constants.ts）
+  status              String   @default("draft") // draft | submitted | quoting | quoted | confirmed | in_progress | completed | cancelled
+
+  // 来源：手工创建 vs Excel 模板解析 vs API
+  source              String   @default("manual") // manual | excel_template | api
+  templateId          String?  @map("template_id") @db.Uuid
+  notes               String?  @db.Text
+
+  // 管理端指派的清关行（可空，未指派时为 null）
+  clearanceAgentId    String?  @map("clearance_agent_id") @db.Uuid
+
+  // 审计
+  createdById         String   @map("created_by_id") @db.Uuid
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+  submittedAt         DateTime? @map("submitted_at")
+  deletedAt           DateTime? @map("deleted_at")
+
+  tenant              Tenant   @relation(fields: [tenantId], references: [id])
+  items               InquiryItem[]
+  attachments         InquiryAttachment[]
+  quote               ClearanceQuote?
+  clearanceAgent      ClearanceAgent? @relation(fields: [clearanceAgentId], references: [id])
+  createdBy           User     @relation("InquiryCreatedBy", fields: [createdById], references: [id])
+
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt])
+  @@index([businessNumber])
+  @@index([clearanceAgentId])
+  @@map("inquiry_orders")
+}
+
+/// 询价单商品明细
+model InquiryItem {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid // 冗余，便于 RLS
+  inquiryOrderId  String   @map("inquiry_order_id") @db.Uuid
+  lineNumber      Int      @map("line_number")
+
+  hsCode          String   @map("hs_code") @db.VarChar(12)
+  description     String   @db.VarChar(500)
+  quantity        Decimal  @db.Decimal(18, 4)
+  unit            String   @db.VarChar(20)
+  unitPrice       Decimal  @map("unit_price") @db.Decimal(18, 4)
+  grossWeightKg   Decimal  @map("gross_weight_kg") @db.Decimal(12, 3)
+  netWeightKg     Decimal  @map("net_weight_kg") @db.Decimal(12, 3)
+  packages        Int
+  originCountry   String?  @map("origin_country") @db.Char(3) // 必要时单独指定原产国
+
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  inquiryOrder    InquiryOrder @relation(fields: [inquiryOrderId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, inquiryOrderId])
+  @@index([hsCode])
+  @@map("inquiry_items")
+}
+
+/// 询价单附件（装箱单、商业发票、Excel 模板等）
+model InquiryAttachment {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  inquiryOrderId  String?  @map("inquiry_order_id") @db.Uuid // 可空：草稿阶段还未关联订单
+  attachmentType  String   @map("attachment_type") // packing_list | commercial_invoice | excel_template | other
+  originalFilename String  @map("original_filename")
+  storageKey      String   @map("storage_key") // OSS 对象 key
+  storageBucket   String   @map("storage_bucket")
+  sizeBytes       BigInt   @map("size_bytes")
+  contentType     String   @map("content_type")
+  sha256          String?  // 文件哈希（防篡改 + 去重）
+
+  // 解析结果（PDF/Excel 解析后的字段，可选）
+  parsedData      Json?    @map("parsed_data")
+  parseStatus     String   @default("pending") @map("parse_status") // pending | success | failed
+  parseError      String?  @map("parse_error") @db.Text
+
+  uploadedById    String   @map("uploaded_by_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at")
+  deletedAt       DateTime? @map("deleted_at")
+
+  inquiryOrder    InquiryOrder? @relation(fields: [inquiryOrderId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, inquiryOrderId])
+  @@index([tenantId, attachmentType])
+  @@map("inquiry_attachments")
+}
+
+// ============================================================
+// 审计日志
+// ============================================================
+
+/// 全局审计日志
+/// 任何"改状态 / 改金额 / 删数据"操作都必须写一条记录
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  tenantId    String?  @map("tenant_id") @db.Uuid // null = 系统级操作
+  userId      String?  @map("user_id") @db.Uuid
+  action      String   // inquiry.create | inquiry.submit | inquiry.update_status | ...
+  resource    String   // 资源类型，如 "inquiry_order"
+  resourceId  String?  @map("resource_id") @db.Uuid
+
+  // 变更前/后快照（关键字段）
+  before      Json?
+  after       Json?
+
+  // 请求上下文
+  ipAddress   String?  @map("ip_address") @db.VarChar(45)
+  userAgent   String?  @map("user_agent") @db.Text
+
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user        User?    @relation(fields: [userId], references: [id])
+
+  @@index([tenantId, createdAt])
+  @@index([resource, resourceId])
+  @@index([userId, createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================================
+// 报价单 / 业务单（管理端）
+// ============================================================
+
+/// 报价单
+model ClearanceQuote {
+  id              String   @id @default(uuid()) @db.Uuid
+  tenantId        String   @map("tenant_id") @db.Uuid
+  inquiryOrderId  String   @unique @map("inquiry_order_id") @db.Uuid
+  businessNumber  String   @unique @map("business_number")
+
+  // 报价明细（JSONB 存储费用项）
+  lineItems       Json     @map("line_items")
+  // 总价（按币种）
+  totalAmount     Decimal  @map("total_amount") @db.Decimal(18, 2)
+  currency        String   @db.Char(3)
+
+  // 利润率（百分比）
+  marginPercent   Decimal? @map("margin_percent") @db.Decimal(5, 2)
+  // 成本合计（不含利润）
+  costAmount      Decimal  @map("cost_amount") @db.Decimal(18, 2)
+
+  // 有效期
+  validUntil      DateTime? @map("valid_until")
+
+  // 状态：draft | pending_approval | approved | sent | accepted | rejected | withdrawn | expired
+  status          String   @default("draft")
+
+  // 内部备注 / 给客户看的备注
+  internalNotes   String?  @map("internal_notes") @db.Text
+  customerNotes   String?  @map("customer_notes") @db.Text
+
+  // 审批/发送/撤回
+  approvedById    String?  @map("approved_by_id") @db.Uuid
+  approvedAt      DateTime? @map("approved_at")
+  sentAt          DateTime? @map("sent_at")
+  acceptedAt      DateTime? @map("accepted_at")
+  rejectedAt      DateTime? @map("rejected_at")
+  withdrawnAt     DateTime? @map("withdrawn_at")
+  withdrawnById   String?  @map("withdrawn_by_id") @db.Uuid
+
+  // PDF（仅占位 — 真实引擎后续接）
+  pdfUrl          String?  @map("pdf_url") @db.Text
+  pdfGeneratedAt  DateTime? @map("pdf_generated_at")
+
+  createdById     String   @map("created_by_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+  deletedAt       DateTime? @map("deleted_at")
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id])
+  inquiryOrder    InquiryOrder @relation(fields: [inquiryOrderId], references: [id])
+
+  @@index([tenantId, status])
+  @@index([inquiryOrderId])
+  @@map("clearance_quotes")
+}
+
+// ============================================================
+// 清关行
+// ============================================================
+
+/// 服务项目录（全局，管理端维护）
+/// 成本&利润配置的明细行通过 service_item_id 引用
+model ServiceItem {
+  id          String   @id @default(uuid()) @db.Uuid
+  code        String   @unique // 业务短码, 如 "CUS-DEC"
+  name        String
+  nameEn      String?  @map("name_en")
+  category    String   // fee | tax | service | surcharge
+  unit        String   @db.VarChar(20) // 必填, 如 次/票/件/立方米
+  description String?  @db.Text
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  costItems   ClearanceCostConfigItem[]
+
+  @@index([category, enabled])
+  @@map("service_items")
+}
+
+model ClearanceAgent {
+  id              String   @id @default(uuid()) @db.Uuid
+  code            String   @unique
+  name            String
+  contactPhone    String?  @map("contact_phone")
+  contactEmail    String?  @map("contact_email")
+  contactAddress  String?  @map("contact_address") @db.Text
+
+  // 专长口岸（逗号分隔的港口代码）
+  specialPorts    String?  @map("special_ports") @db.Text
+
+  // 资质（JSONB：经营许可证、备案号等）
+  qualifications  Json?
+
+  // 合作状态：active | suspended | terminated
+  status          String   @default("active")
+
+  // 绩效（手动维护）
+  performanceRating Decimal? @map("performance_rating") @db.Decimal(3, 2)
+  notes           String?  @db.Text
+
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+  deletedAt       DateTime? @map("deleted_at")
+
+  costConfigs     ClearanceCostConfig[]
+  inquiryOrders   InquiryOrder[]
+
+  @@index([status])
+  @@map("clearance_agents")
+}
+
+/// 成本配置（公式引擎存储）
+model ClearanceCostConfig {
+  id              String   @id @default(uuid()) @db.Uuid
+  agentId         String?  @map("agent_id") @db.Uuid
+  name            String
+
+  // 适用条件（JSONB）：
+  // { ports: ['SHA', 'HAM'], hs_codes: ['85*'], cargo_types: ['normal'] }
+  conditions      Json
+
+  // 优先级（多个匹配时优先级高的生效）
+  priority        Int      @default(100)
+
+  // 启用状态
+  enabled         Boolean  @default(true)
+  effectiveFrom   DateTime? @map("effective_from")
+  effectiveTo     DateTime? @map("effective_to")
+
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  agent           ClearanceAgent? @relation(fields: [agentId], references: [id])
+  items           ClearanceCostConfigItem[]
+
+  @@index([agentId, priority])
+  @@map("clearance_cost_configs")
+}
+
+/// 成本&利润配置的明细行 — 引用服务项目录
+model ClearanceCostConfigItem {
+  id            String   @id @default(uuid()) @db.Uuid
+  costConfigId  String   @map("cost_config_id") @db.Uuid
+  serviceItemId String   @map("service_item_id") @db.Uuid
+  costAmount    Decimal  @map("cost_amount")   @db.Decimal(18, 2)
+  profitType    String   @map("profit_type")    // "percent" | "fixed"
+  profitValue   Decimal  @map("profit_value")   @db.Decimal(18, 4)
+  sortOrder     Int      @default(0) @map("sort_order")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  costConfig    ClearanceCostConfig @relation(fields: [costConfigId], references: [id], onDelete: Cascade)
+  serviceItem   ServiceItem        @relation(fields: [serviceItemId], references: [id])
+
+  @@index([costConfigId, sortOrder])
+  @@map("clearance_cost_config_items")
+}
+
+/// 报价配置（利润率模板）
+model ClearanceQuoteConfig {
+  id              String   @id @default(uuid()) @db.Uuid
+  name            String
+  // 适用条件（同 cost_config）
+  conditions      Json
+  // 利润率（百分比）
+  marginPercent   Decimal  @map("margin_percent") @db.Decimal(5, 2)
+  // 最低收费
+  minimumCharge   Decimal? @map("minimum_charge") @db.Decimal(18, 2)
+  // 启用状态
+  enabled         Boolean  @default(true)
+  priority        Int      @default(100)
+
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@index([priority])
+  @@map("clearance_quote_configs")
+}
+
+// ============================================================
+// 卡车服务（LTL/FTL/港到门）
+// ============================================================
+
+model TruckService {
+  id              String   @id @default(uuid()) @db.Uuid
+  serviceType     String   @map("service_type") // ltl | ftl | port_to_door
+  code            String   @unique
+
+  // 基础信息
+  name            String
+  originRegion    String?  @map("origin_region")
+  destinationRegion String? @map("destination_region")
+
+  // 计费方式：flat（包干）| per_km（按公里）| per_kg（按重量）| per_cbm（按体积）
+  pricingModel    String   @map("pricing_model")
+  basePrice       Decimal  @map("base_price") @db.Decimal(18, 2)
+  unitPrice       Decimal? @map("unit_price") @db.Decimal(18, 4)
+
+  // 车型/柜型
+  vehicleType     String?  @map("vehicle_type")
+  containerType   String?  @map("container_type")
+
+  // 附加费（JSONB：燃油费、过路费等）
+  surcharges      Json?
+
+  // 适用条件
+  conditions      Json?
+
+  // 状态
+  enabled         Boolean  @default(true)
+  notes           String?  @db.Text
+
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+  deletedAt       DateTime? @map("deleted_at")
+
+  @@index([serviceType, enabled])
+  @@map("truck_services")
+}
+
+// ============================================================
+// 基础数据字典（口岸/HS Code/币种等）
+// ============================================================
+
+model DictionaryEntry {
+  id              String   @id @default(uuid()) @db.Uuid
+  category        String   // port | hs_code | country | currency | unit
+  code            String
+  nameZh          String   @map("name_zh")
+  nameEn          String?  @map("name_en")
+  parentCode      String?  @map("parent_code")
+  extra           Json?
+  enabled         Boolean  @default(true)
+
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@unique([category, code])
+  @@index([category, enabled])
+  @@map("dictionary_entries")
+}
